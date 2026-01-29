@@ -19,6 +19,12 @@ if [ -f "./config/settings.yaml" ]; then
     LANG_SETTING=$(grep "^language:" ./config/settings.yaml 2>/dev/null | awk '{print $2}' || echo "ja")
 fi
 
+# シェル設定を読み取り（デフォルト: bash）
+SHELL_SETTING="bash"
+if [ -f "./config/settings.yaml" ]; then
+    SHELL_SETTING=$(grep "^shell:" ./config/settings.yaml 2>/dev/null | awk '{print $2}' || echo "bash")
+fi
+
 # 色付きログ関数（戦国風）
 log_info() {
     echo -e "\033[1;33m【報】\033[0m $1"
@@ -33,10 +39,41 @@ log_war() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# プロンプト生成関数（bash/zsh対応）
+# ───────────────────────────────────────────────────────────────────────────────
+# 使用法: generate_prompt "ラベル" "色" "シェル"
+# 色: red, green, blue, magenta, cyan, yellow
+# ═══════════════════════════════════════════════════════════════════════════════
+generate_prompt() {
+    local label="$1"
+    local color="$2"
+    local shell_type="$3"
+
+    if [ "$shell_type" == "zsh" ]; then
+        # zsh用: %F{color}%B...%b%f 形式
+        echo "(%F{${color}}%B${label}%b%f) %F{green}%B%~%b%f%# "
+    else
+        # bash用: \[\033[...m\] 形式
+        local color_code
+        case "$color" in
+            red)     color_code="1;31" ;;
+            green)   color_code="1;32" ;;
+            yellow)  color_code="1;33" ;;
+            blue)    color_code="1;34" ;;
+            magenta) color_code="1;35" ;;
+            cyan)    color_code="1;36" ;;
+            *)       color_code="1;37" ;;  # white (default)
+        esac
+        echo "(\[\033[${color_code}m\]${label}\[\033[0m\]) \[\033[1;32m\]\w\[\033[0m\]\$ "
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # オプション解析
 # ═══════════════════════════════════════════════════════════════════════════════
 SETUP_ONLY=false
 OPEN_TERMINAL=false
+SHELL_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -48,6 +85,15 @@ while [[ $# -gt 0 ]]; do
             OPEN_TERMINAL=true
             shift
             ;;
+        -shell|--shell)
+            if [[ -n "$2" && "$2" != -* ]]; then
+                SHELL_OVERRIDE="$2"
+                shift 2
+            else
+                echo "エラー: -shell オプションには bash または zsh を指定してください"
+                exit 1
+            fi
+            ;;
         -h|--help)
             echo ""
             echo "🏯 multi-agent-shogun 出陣スクリプト"
@@ -55,14 +101,18 @@ while [[ $# -gt 0 ]]; do
             echo "使用方法: ./shutsujin_departure.sh [オプション]"
             echo ""
             echo "オプション:"
-            echo "  -s, --setup-only  tmuxセッションのセットアップのみ（Claude起動なし）"
-            echo "  -t, --terminal    Windows Terminal で新しいタブを開く"
-            echo "  -h, --help        このヘルプを表示"
+            echo "  -s, --setup-only    tmuxセッションのセットアップのみ（Claude起動なし）"
+            echo "  -t, --terminal      Windows Terminal で新しいタブを開く"
+            echo "  -shell, --shell SH  シェルを指定（bash または zsh）"
+            echo "                      未指定時は config/settings.yaml の設定を使用"
+            echo "  -h, --help          このヘルプを表示"
             echo ""
             echo "例:"
-            echo "  ./shutsujin_departure.sh      # 全エージェント起動（通常の出陣）"
-            echo "  ./shutsujin_departure.sh -s   # セットアップのみ（手動でClaude起動）"
-            echo "  ./shutsujin_departure.sh -t   # 全エージェント起動 + ターミナルタブ展開"
+            echo "  ./shutsujin_departure.sh              # 全エージェント起動（通常の出陣）"
+            echo "  ./shutsujin_departure.sh -s           # セットアップのみ（手動でClaude起動）"
+            echo "  ./shutsujin_departure.sh -t           # 全エージェント起動 + ターミナルタブ展開"
+            echo "  ./shutsujin_departure.sh -shell bash  # bash用プロンプトで起動"
+            echo "  ./shutsujin_departure.sh -shell zsh   # zsh用プロンプトで起動"
             echo ""
             echo "エイリアス:"
             echo "  csst  → cd /mnt/c/tools/multi-agent-shogun && ./shutsujin_departure.sh"
@@ -78,6 +128,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# シェル設定のオーバーライド（コマンドラインオプション優先）
+if [ -n "$SHELL_OVERRIDE" ]; then
+    if [[ "$SHELL_OVERRIDE" == "bash" || "$SHELL_OVERRIDE" == "zsh" ]]; then
+        SHELL_SETTING="$SHELL_OVERRIDE"
+    else
+        echo "エラー: -shell オプションには bash または zsh を指定してください（指定値: $SHELL_OVERRIDE）"
+        exit 1
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 出陣バナー表示（CC0ライセンスASCIIアート使用）
@@ -151,9 +211,50 @@ tmux kill-session -t multiagent 2>/dev/null && log_info "  └─ multiagent陣�
 tmux kill-session -t shogun 2>/dev/null && log_info "  └─ shogun本陣、撤収完了" || log_info "  └─ shogun本陣は存在せず"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1.5: 前回記録のバックアップ（内容がある場合のみ）
+# ═══════════════════════════════════════════════════════════════════════════════
+BACKUP_DIR="./logs/backup_$(date '+%Y%m%d_%H%M%S')"
+NEED_BACKUP=false
+
+if [ -f "./dashboard.md" ]; then
+    if grep -q "cmd_" "./dashboard.md" 2>/dev/null; then
+        NEED_BACKUP=true
+    fi
+fi
+
+if [ "$NEED_BACKUP" = true ]; then
+    mkdir -p "$BACKUP_DIR" || true
+    cp "./dashboard.md" "$BACKUP_DIR/" 2>/dev/null || true
+    cp -r "./queue/reports" "$BACKUP_DIR/" 2>/dev/null || true
+    cp -r "./queue/tasks" "$BACKUP_DIR/" 2>/dev/null || true
+    cp "./queue/shogun_to_karo.yaml" "$BACKUP_DIR/" 2>/dev/null || true
+    log_info "📦 前回の記録をバックアップ: $BACKUP_DIR"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 2: 報告ファイルリセット
 # ═══════════════════════════════════════════════════════════════════════════════
 log_info "📜 前回の軍議記録を破棄中..."
+
+# queue ディレクトリが存在しない場合は作成
+[ -d ./queue/reports ] || mkdir -p ./queue/reports
+[ -d ./queue/tasks ] || mkdir -p ./queue/tasks
+
+# 足軽タスクファイルリセット
+for i in {1..8}; do
+    cat > ./queue/tasks/ashigaru${i}.yaml << EOF
+# 足軽${i}専用タスクファイル
+task:
+  task_id: null
+  parent_cmd: null
+  description: null
+  target_path: null
+  status: idle
+  timestamp: ""
+EOF
+done
+
+# 足軽レポートファイルリセット
 for i in {1..8}; do
     cat > ./queue/reports/ashigaru${i}_report.yaml << EOF
 worker_id: ashigaru${i}
@@ -279,16 +380,45 @@ else
 EOF
 fi
 
-log_success "  └─ ダッシュボード初期化完了 (言語: $LANG_SETTING)"
+log_success "  └─ ダッシュボード初期化完了 (言語: $LANG_SETTING, シェル: $SHELL_SETTING)"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 4: multiagentセッション作成（9ペイン：karo + ashigaru1-8）
 # ═══════════════════════════════════════════════════════════════════════════════
+# tmux の存在確認
+if ! command -v tmux &> /dev/null; then
+    echo ""
+    echo "  ╔════════════════════════════════════════════════════════╗"
+    echo "  ║  [ERROR] tmux not found!                              ║"
+    echo "  ║  tmux が見つかりません                                 ║"
+    echo "  ╠════════════════════════════════════════════════════════╣"
+    echo "  ║  Run first_setup.sh first:                            ║"
+    echo "  ║  まず first_setup.sh を実行してください:               ║"
+    echo "  ║     ./first_setup.sh                                  ║"
+    echo "  ╚════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+fi
+
 log_war "⚔️ 家老・足軽の陣を構築中（9名配備）..."
 
 # 最初のペイン作成
-tmux new-session -d -s multiagent -n "agents"
+if ! tmux new-session -d -s multiagent -n "agents" 2>/dev/null; then
+    echo ""
+    echo "  ╔════════════════════════════════════════════════════════════╗"
+    echo "  ║  [ERROR] Failed to create tmux session 'multiagent'      ║"
+    echo "  ║  tmux セッション 'multiagent' の作成に失敗しました       ║"
+    echo "  ╠════════════════════════════════════════════════════════════╣"
+    echo "  ║  An existing session may be running.                     ║"
+    echo "  ║  既存セッションが残っている可能性があります              ║"
+    echo "  ║                                                          ║"
+    echo "  ║  Check: tmux ls                                          ║"
+    echo "  ║  Kill:  tmux kill-session -t multiagent                  ║"
+    echo "  ╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+fi
 
 # 3x3グリッド作成（合計9ペイン）
 # 最初に3列に分割
@@ -310,11 +440,13 @@ tmux split-window -v
 
 # ペインタイトル設定（0: karo, 1-8: ashigaru1-8）
 PANE_TITLES=("karo" "ashigaru1" "ashigaru2" "ashigaru3" "ashigaru4" "ashigaru5" "ashigaru6" "ashigaru7" "ashigaru8")
-PANE_COLORS=("1;31" "1;34" "1;34" "1;34" "1;34" "1;34" "1;34" "1;34" "1;34")  # karo: 赤, ashigaru: 青
+# 色設定（karo: 赤, ashigaru: 青）
+PANE_COLORS=("red" "blue" "blue" "blue" "blue" "blue" "blue" "blue" "blue")
 
 for i in {0..8}; do
     tmux select-pane -t "multiagent:0.$i" -T "${PANE_TITLES[$i]}"
-    tmux send-keys -t "multiagent:0.$i" "cd $(pwd) && export PS1='(\[\033[${PANE_COLORS[$i]}m\]${PANE_TITLES[$i]}\[\033[0m\]) \[\033[1;32m\]\w\[\033[0m\]\$ ' && clear" Enter
+    PROMPT_STR=$(generate_prompt "${PANE_TITLES[$i]}" "${PANE_COLORS[$i]}" "$SHELL_SETTING")
+    tmux send-keys -t "multiagent:0.$i" "cd \"$(pwd)\" && export PS1='${PROMPT_STR}' && clear" Enter
 done
 
 log_success "  └─ 家老・足軽の陣、構築完了"
@@ -324,8 +456,23 @@ echo ""
 # STEP 5: shogunセッション作成（1ペイン）
 # ═══════════════════════════════════════════════════════════════════════════════
 log_war "👑 将軍の本陣を構築中..."
-tmux new-session -d -s shogun
-tmux send-keys -t shogun "cd $(pwd) && export PS1='(\[\033[1;35m\]将軍\[\033[0m\]) \[\033[1;32m\]\w\[\033[0m\]\$ ' && clear" Enter
+if ! tmux new-session -d -s shogun 2>/dev/null; then
+    echo ""
+    echo "  ╔════════════════════════════════════════════════════════════╗"
+    echo "  ║  [ERROR] Failed to create tmux session 'shogun'          ║"
+    echo "  ║  tmux セッション 'shogun' の作成に失敗しました           ║"
+    echo "  ╠════════════════════════════════════════════════════════════╣"
+    echo "  ║  An existing session may be running.                     ║"
+    echo "  ║  既存セッションが残っている可能性があります              ║"
+    echo "  ║                                                          ║"
+    echo "  ║  Check: tmux ls                                          ║"
+    echo "  ║  Kill:  tmux kill-session -t shogun                      ║"
+    echo "  ╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+fi
+SHOGUN_PROMPT=$(generate_prompt "将軍" "magenta" "$SHELL_SETTING")
+tmux send-keys -t shogun "cd \"$(pwd)\" && export PS1='${SHOGUN_PROMPT}' && clear" Enter
 tmux select-pane -t shogun:0.0 -P 'bg=#002b36'  # 将軍の Solarized Dark
 
 log_success "  └─ 将軍の本陣、構築完了"
@@ -335,6 +482,14 @@ echo ""
 # STEP 6: Claude Code 起動（--setup-only でスキップ）
 # ═══════════════════════════════════════════════════════════════════════════════
 if [ "$SETUP_ONLY" = false ]; then
+    # Claude Code CLI の存在チェック
+    if ! command -v claude &> /dev/null; then
+        log_info "⚠️  claude コマンドが見つかりません"
+        echo "  first_setup.sh を再実行してください:"
+        echo "    ./first_setup.sh"
+        exit 1
+    fi
+
     log_war "👑 全軍に Claude Code を召喚中..."
 
     # 将軍
@@ -426,8 +581,16 @@ NINJA_EOF
     echo -e "                               \033[0;36m[ASCII Art: syntax-samurai/ryu - CC0 1.0 Public Domain]\033[0m"
     echo ""
 
-    echo "  Claude Code の起動を待機中（15秒）..."
-    sleep 15
+    echo "  Claude Code の起動を待機中（最大30秒）..."
+
+    # 将軍の起動を確認（最大30秒待機）
+    for i in {1..30}; do
+        if tmux capture-pane -t shogun -p | grep -q "bypass permissions"; then
+            echo "  └─ 将軍の Claude Code 起動確認完了（${i}秒）"
+            break
+        fi
+        sleep 1
+    done
 
     # 将軍に指示書を読み込ませる
     log_info "  └─ 将軍に指示書を伝達中..."
